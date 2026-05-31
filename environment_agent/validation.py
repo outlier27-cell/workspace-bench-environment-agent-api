@@ -71,11 +71,20 @@ def validate_planned_step(
     workspace_artifact_ids = {artifact.artifact_id for artifact in workspace.artifacts}
     plan_artifact_ids = {item.artifact_id for item in plan.artifact_plan}
     valid_artifact_ids = workspace_artifact_ids | plan_artifact_ids
+    active_dependency_edges = {
+        (edge.source_artifact_id, edge.target_artifact_id, edge.relation)
+        for edge in workspace.dependency_edges
+        if edge.is_active
+    }
 
     for item in plan.artifact_plan:
         if item.workunit_id not in valid_workunit_ids:
             errors.append(
                 f"artifact '{item.artifact_id}' references unknown workunit '{item.workunit_id}'"
+            )
+        if item.action == "reference" and item.artifact_id not in workspace_artifact_ids:
+            errors.append(
+                f"artifact '{item.artifact_id}' uses reference action but is not present in workspace state"
             )
         for dependency_id in item.depends_on:
             if dependency_id not in valid_artifact_ids:
@@ -96,6 +105,18 @@ def validate_planned_step(
             errors.append(
                 f"dependency target '{dependency.target_artifact_id}' is not in workspace or artifact plan"
             )
+        if dependency.action in {"remove", "mark_stale"}:
+            key = (
+                dependency.source_artifact_id,
+                dependency.target_artifact_id,
+                dependency.relation,
+            )
+            if key not in active_dependency_edges:
+                errors.append(
+                    f"dependency '{dependency.source_artifact_id}' -> "
+                    f"'{dependency.target_artifact_id}' relation '{dependency.relation}' "
+                    "is not currently active in workspace state"
+                )
 
     for opportunity in planned_step.task_opportunities:
         for artifact_id in opportunity.required_artifact_ids:

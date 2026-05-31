@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
+from threading import RLock
 from typing import TypeVar
 
 from environment_agent.schemas import (
@@ -37,6 +40,7 @@ def _lookup(mapping: dict[str, T], resource_type: str, resource_id: str) -> T:
 
 class MockEnvironmentStore:
     def __init__(self) -> None:
+        self._lock = RLock()
         self._users = {
             "user_logistics_001": UserProfile(
                 user_id="user_logistics_001",
@@ -160,76 +164,94 @@ class MockEnvironmentStore:
         self._initial_events = deepcopy(self._events)
         self._initial_step_responses = deepcopy(self._step_responses)
 
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        with self._lock:
+            yield
+
     def get_user_profile(self, user_id: str) -> UserProfile:
-        return deepcopy(_lookup(self._users, "user", user_id))
+        with self._lock:
+            return deepcopy(_lookup(self._users, "user", user_id))
 
     def get_environment_profile(self, environment_id: str) -> EnvironmentProfile:
-        return deepcopy(_lookup(self._environments, "environment", environment_id))
+        with self._lock:
+            return deepcopy(_lookup(self._environments, "environment", environment_id))
 
     def get_workspace_state(self, workspace_id: str) -> WorkspaceState:
-        return deepcopy(_lookup(self._states, "workspace", workspace_id))
+        with self._lock:
+            return deepcopy(_lookup(self._states, "workspace", workspace_id))
 
     def set_workspace_state(self, workspace_state: WorkspaceState) -> None:
-        self._states[workspace_state.workspace_id] = deepcopy(workspace_state)
+        with self._lock:
+            self._states[workspace_state.workspace_id] = deepcopy(workspace_state)
 
     def get_historical_tasks(self, workspace_id: str) -> HistoricalTasks:
-        return deepcopy(_lookup(self._histories, "workspace", workspace_id))
+        with self._lock:
+            return deepcopy(_lookup(self._histories, "workspace", workspace_id))
 
     def list_event_ids(self, workspace_id: str) -> list[str]:
-        return list(self._event_ids.get(workspace_id, []))
+        with self._lock:
+            return list(self._event_ids.get(workspace_id, []))
 
     def list_events(self, workspace_id: str) -> list[ExternalEvent]:
-        return deepcopy(self._events.get(workspace_id, []))
+        with self._lock:
+            return deepcopy(self._events.get(workspace_id, []))
 
     def list_step_responses(self, workspace_id: str) -> list[AgentStepResponse]:
-        return deepcopy(self._step_responses.get(workspace_id, []))
+        with self._lock:
+            return deepcopy(self._step_responses.get(workspace_id, []))
 
     def append_event(self, workspace_id: str, event: ExternalEvent) -> None:
-        event_ids = self._event_ids.setdefault(workspace_id, [])
-        if event.event_id not in event_ids:
-            event_ids.append(event.event_id)
-            self._events.setdefault(workspace_id, []).append(deepcopy(event))
+        with self._lock:
+            event_ids = self._event_ids.setdefault(workspace_id, [])
+            if event.event_id not in event_ids:
+                event_ids.append(event.event_id)
+                self._events.setdefault(workspace_id, []).append(deepcopy(event))
 
     def append_step_response(self, workspace_id: str, response: AgentStepResponse) -> None:
-        steps = self._step_responses.setdefault(workspace_id, [])
-        existing_event_ids = {step.external_event.event_id for step in steps}
-        if response.external_event.event_id not in existing_event_ids:
-            steps.append(deepcopy(response))
+        with self._lock:
+            steps = self._step_responses.setdefault(workspace_id, [])
+            existing_event_ids = {step.external_event.event_id for step in steps}
+            if response.external_event.event_id not in existing_event_ids:
+                steps.append(deepcopy(response))
 
     def next_event_index(self, workspace_id: str) -> int:
-        return len(self._event_ids.get(workspace_id, [])) + 1
+        with self._lock:
+            return len(self._event_ids.get(workspace_id, [])) + 1
 
     def append_generated_tasks(
         self,
         workspace_id: str,
         opportunities: list[TaskOpportunity | dict],
     ) -> None:
-        history = self._histories[workspace_id]
-        existing_task_ids = {item.task_id for item in history.items}
-        for opportunity in opportunities:
-            data = (
-                opportunity.model_dump()
-                if isinstance(opportunity, TaskOpportunity)
-                else opportunity
-            )
-            task_id = f"task_from_{data['opportunity_id']}"
-            if task_id in existing_task_ids:
-                continue
-            history.items.append(
-                TaskHistoryItem(
-                    task_id=task_id,
-                    task_type=data["task_type"],
-                    capability_tags=list(data.get("capability_tags", [])),
-                    source_event_ids=[data["source_event_id"]],
+        with self._lock:
+            history = self._histories[workspace_id]
+            existing_task_ids = {item.task_id for item in history.items}
+            for opportunity in opportunities:
+                data = (
+                    opportunity.model_dump()
+                    if isinstance(opportunity, TaskOpportunity)
+                    else opportunity
                 )
-            )
-            existing_task_ids.add(task_id)
+                task_id = f"task_from_{data['opportunity_id']}"
+                if task_id in existing_task_ids:
+                    continue
+                history.items.append(
+                    TaskHistoryItem(
+                        task_id=task_id,
+                        task_type=data["task_type"],
+                        capability_tags=list(data.get("capability_tags", [])),
+                        source_event_ids=[data["source_event_id"]],
+                    )
+                )
+                existing_task_ids.add(task_id)
 
     def reset_workspace(self, workspace_id: str) -> None:
-        if workspace_id not in self._initial_states:
-            raise StoreResourceNotFound("workspace", workspace_id)
-        self._states[workspace_id] = deepcopy(self._initial_states[workspace_id])
-        self._histories[workspace_id] = deepcopy(self._initial_histories[workspace_id])
-        self._event_ids[workspace_id] = deepcopy(self._initial_event_ids[workspace_id])
-        self._events[workspace_id] = deepcopy(self._initial_events[workspace_id])
-        self._step_responses[workspace_id] = deepcopy(self._initial_step_responses[workspace_id])
+        with self._lock:
+            if workspace_id not in self._initial_states:
+                raise StoreResourceNotFound("workspace", workspace_id)
+            self._states[workspace_id] = deepcopy(self._initial_states[workspace_id])
+            self._histories[workspace_id] = deepcopy(self._initial_histories[workspace_id])
+            self._event_ids[workspace_id] = deepcopy(self._initial_event_ids[workspace_id])
+            self._events[workspace_id] = deepcopy(self._initial_events[workspace_id])
+            self._step_responses[workspace_id] = deepcopy(self._initial_step_responses[workspace_id])

@@ -1,8 +1,9 @@
 from fastapi.testclient import TestClient
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 
 from api.index import app
-from environment_agent.api import reset_mock_store_for_tests
+from environment_agent.api import _store_for_run, reset_mock_store_for_tests
 
 
 @pytest.fixture(autouse=True)
@@ -169,3 +170,58 @@ def test_manager_payload_apply_to_mock_state_persists_requested_evolution():
     assert response.json()["validation_report"]["status"] == "passed"
     assert after["event_count"] == before["event_count"] + 1
     assert after["snapshot_id"] == "snap_0002"
+
+
+def test_direct_step_handles_unstructured_snapshot_id_when_applying_state():
+    client = TestClient(app, raise_server_exceptions=False)
+    base_store = _store_for_run("default")
+    workspace = base_store.get_workspace_state("workspace_logistics_demo")
+    workspace.current_snapshot_id = "snapshot-alpha"
+    payload = {
+        "user_profile": base_store.get_user_profile("user_logistics_001").model_dump(),
+        "environment_profile": base_store.get_environment_profile("env_peak_logistics").model_dump(),
+        "workspace_state": workspace.model_dump(),
+        "historical_tasks": base_store.get_historical_tasks("workspace_logistics_demo").model_dump(),
+        "seed": 7,
+        "apply_to_mock_state": True,
+    }
+
+    response = client.post("/api/environment-agent/step", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["updated_workspace_state"]["current_snapshot_id"] == "snapshot-alpha_0001"
+
+
+def test_concurrent_store_backed_steps_reserve_unique_event_indices(monkeypatch):
+    original_next_event_index = _store_for_run("default").next_event_index
+
+    def slow_next_event_index(workspace_id: str) -> int:
+        import time
+
+        time.sleep(0.02)
+        return original_next_event_index(workspace_id)
+
+    monkeypatch.setattr(_store_for_run("default"), "next_event_index", slow_next_event_index)
+    payload = {
+        "user_id": "user_logistics_001",
+        "environment_id": "env_peak_logistics",
+        "workspace_id": "workspace_logistics_demo",
+        "seed": 7,
+        "apply_to_mock_state": True,
+    }
+
+    def post_step(_index: int):
+        client = TestClient(app, raise_server_exceptions=False)
+        return client.post("/api/environment-agent/step/from-store", json=payload)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        responses = list(executor.map(post_step, range(8)))
+
+    assert [response.status_code for response in responses] == [200] * 8
+    event_ids = [response.json()["external_event"]["event_id"] for response in responses]
+    assert len(event_ids) == len(set(event_ids))
+
+    ledger_response = TestClient(app).get("/api/workspace/workspace_logistics_demo/events")
+    ledger_event_ids = ledger_response.json()["event_ids"]
+    assert len(ledger_event_ids) == 8
+    assert set(ledger_event_ids) == set(event_ids)

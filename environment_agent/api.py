@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from threading import RLock
 from typing import Annotated
 
 from fastapi import FastAPI, Query, Request
@@ -36,6 +37,7 @@ store = MockEnvironmentStore()
 MAX_RUN_STORES = 32
 RunId = Annotated[str, Query(min_length=1, max_length=48, pattern=RUN_ID_PATTERN)]
 run_stores: OrderedDict[str, MockEnvironmentStore] = OrderedDict()
+run_stores_lock = RLock()
 agent = EnvironmentAgent()
 
 
@@ -74,20 +76,22 @@ def store_resource_not_found_exception_handler(
 
 def reset_mock_store_for_tests() -> None:
     global store, run_stores
-    store = MockEnvironmentStore()
-    run_stores = OrderedDict()
+    with run_stores_lock:
+        store = MockEnvironmentStore()
+        run_stores = OrderedDict()
 
 
 def _store_for_run(run_id: str | None = None) -> MockEnvironmentStore:
     if run_id in (None, "", "default"):
         return store
-    if run_id in run_stores:
-        run_stores.move_to_end(run_id)
+    with run_stores_lock:
+        if run_id in run_stores:
+            run_stores.move_to_end(run_id)
+            return run_stores[run_id]
+        if len(run_stores) >= MAX_RUN_STORES:
+            run_stores.popitem(last=False)
+        run_stores[run_id] = MockEnvironmentStore()
         return run_stores[run_id]
-    if len(run_stores) >= MAX_RUN_STORES:
-        run_stores.popitem(last=False)
-    run_stores[run_id] = MockEnvironmentStore()
-    return run_stores[run_id]
 
 
 def _persist_agent_response(
@@ -101,6 +105,23 @@ def _persist_agent_response(
     target_store.append_event(workspace_id, response.external_event)
     target_store.append_generated_tasks(workspace_id, response.task_opportunities)
     target_store.append_step_response(workspace_id, response)
+
+
+def _run_agent_step_from_store(target_store: MockEnvironmentStore, request: FromStoreRequest) -> AgentStepResponse:
+    with target_store.locked():
+        event_index = target_store.next_event_index(request.workspace_id)
+        agent_request = AgentStepRequest(
+            user_profile=target_store.get_user_profile(request.user_id),
+            environment_profile=target_store.get_environment_profile(request.environment_id),
+            workspace_state=target_store.get_workspace_state(request.workspace_id),
+            historical_tasks=target_store.get_historical_tasks(request.workspace_id),
+            seed=request.seed,
+            event_index=event_index,
+            apply_to_mock_state=request.apply_to_mock_state,
+        )
+        response = agent.step(agent_request)
+        _persist_agent_response(target_store, request.workspace_id, response)
+        return response
 
 
 class FromStoreRequest(BaseModel):
@@ -201,65 +222,43 @@ def step(request: AgentStepRequest) -> AgentStepResponse:
 @app.post("/environment-agent/step/from-store", response_model=AgentStepResponse)
 def step_from_store(request: FromStoreRequest) -> AgentStepResponse:
     target_store = _store_for_run(request.run_id)
-    event_index = target_store.next_event_index(request.workspace_id)
-    agent_request = AgentStepRequest(
-        user_profile=target_store.get_user_profile(request.user_id),
-        environment_profile=target_store.get_environment_profile(request.environment_id),
-        workspace_state=target_store.get_workspace_state(request.workspace_id),
-        historical_tasks=target_store.get_historical_tasks(request.workspace_id),
-        seed=request.seed,
-        event_index=event_index,
-        apply_to_mock_state=request.apply_to_mock_state,
-    )
-    response = agent.step(agent_request)
-    _persist_agent_response(target_store, request.workspace_id, response)
-    return response
+    return _run_agent_step_from_store(target_store, request)
 
 
 @app.post("/environment-agent/manager-payload/from-store")
 def manager_payload_from_store(request: FromStoreRequest):
     target_store = _store_for_run(request.run_id)
-    event_index = target_store.next_event_index(request.workspace_id)
-    agent_request = AgentStepRequest(
-        user_profile=target_store.get_user_profile(request.user_id),
-        environment_profile=target_store.get_environment_profile(request.environment_id),
-        workspace_state=target_store.get_workspace_state(request.workspace_id),
-        historical_tasks=target_store.get_historical_tasks(request.workspace_id),
-        seed=request.seed,
-        event_index=event_index,
-        apply_to_mock_state=request.apply_to_mock_state,
-    )
-    response = agent.step(agent_request)
-    _persist_agent_response(target_store, request.workspace_id, response)
+    response = _run_agent_step_from_store(target_store, request)
     return build_manager_payload(response)
 
 
 @app.post("/environment-agent/simulate", response_model=SimulationResponse)
 def simulate(request: SimulationRequest) -> SimulationResponse:
     target_store = _store_for_run(request.run_id)
-    if request.reset_before_run:
-        target_store.reset_workspace(request.workspace_id)
+    with target_store.locked():
+        if request.reset_before_run:
+            target_store.reset_workspace(request.workspace_id)
 
-    responses: list[AgentStepResponse] = []
-    for offset in range(request.steps):
-        event_index = target_store.next_event_index(request.workspace_id)
-        agent_request = AgentStepRequest(
-            user_profile=target_store.get_user_profile(request.user_id),
-            environment_profile=target_store.get_environment_profile(request.environment_id),
-            workspace_state=target_store.get_workspace_state(request.workspace_id),
-            historical_tasks=target_store.get_historical_tasks(request.workspace_id),
-            seed=request.seed + offset,
-            event_index=event_index,
-            apply_to_mock_state=True,
+        responses: list[AgentStepResponse] = []
+        for offset in range(request.steps):
+            event_index = target_store.next_event_index(request.workspace_id)
+            agent_request = AgentStepRequest(
+                user_profile=target_store.get_user_profile(request.user_id),
+                environment_profile=target_store.get_environment_profile(request.environment_id),
+                workspace_state=target_store.get_workspace_state(request.workspace_id),
+                historical_tasks=target_store.get_historical_tasks(request.workspace_id),
+                seed=request.seed + offset,
+                event_index=event_index,
+                apply_to_mock_state=True,
+            )
+            response = agent.step(agent_request)
+            assert response.updated_workspace_state is not None
+            _persist_agent_response(target_store, request.workspace_id, response)
+            responses.append(response)
+
+        return SimulationResponse(
+            workspace_id=request.workspace_id,
+            steps=responses,
+            final_workspace_state=target_store.get_workspace_state(request.workspace_id),
+            event_ids=target_store.list_event_ids(request.workspace_id),
         )
-        response = agent.step(agent_request)
-        assert response.updated_workspace_state is not None
-        _persist_agent_response(target_store, request.workspace_id, response)
-        responses.append(response)
-
-    return SimulationResponse(
-        workspace_id=request.workspace_id,
-        steps=responses,
-        final_workspace_state=target_store.get_workspace_state(request.workspace_id),
-        event_ids=target_store.list_event_ids(request.workspace_id),
-    )
